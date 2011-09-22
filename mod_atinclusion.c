@@ -24,9 +24,12 @@ typedef struct req_cfg {
 	htmlParserCtxtPtr parser;
 }Req_cfg;
 
+typedef struct ctx {
+	request_rec *r;
+} Ctx;
+
 /* global module structure */
 module AP_MODULE_DECLARE_DATA atinclusion_module ;
-static char* allocate_str(apr_pool_t* p, char* src);
 static char* stringify_atinclusions(request_rec *r);
 static char* split_and_next(char* str, char splitter);
 static int storeatinclusions(char *atinclusions, request_rec *r);
@@ -53,7 +56,7 @@ static char* stringify_atinclusions(request_rec *r){
 		iSplitter = 1;
 	}
 	// remove the first comma and allocate:
-	return allocate_str(p, ret );
+	return apr_pstrdup(p, ret );
 }
 
 static apr_status_t freeParser(void* p){
@@ -62,14 +65,7 @@ static apr_status_t freeParser(void* p){
 	return OK;
 }
 
-static char* allocate_str(apr_pool_t* p, char* src)
-{
-	/*char *dest = apr_palloc(p, sizeof(char)*strlen(src));
-	strcpy(dest, src);*/
-	
-	
-	return apr_pstrdup(p, src);
-}
+
 
 static char* split_and_next(char* str, char splitter)
 {
@@ -81,12 +77,27 @@ static char* split_and_next(char* str, char splitter)
 	return next;
 }
 
-static Req_cfg* setConfig(request_rec *r){
+static void pStartElement(void *vCtx, xmlChar *uname, xmlChar **uattr)
+{
+	Ctx *ctx = (Ctx*) vCtx;
+	int i = 0;
+	xmlChar *attr;
+	while((attr = uattr[i]) != NULL) 
+	{
+		loginfo(ctx->r, "%s", (const char*) attr);
+	}
+	loginfo(ctx->r, "fin startElement");	
+}
+
+static Req_cfg* set_config(request_rec *r){
 	Req_cfg *rc = apr_palloc(r->pool, sizeof(Req_cfg));
+	htmlSAXHandler *sax = apr_palloc(r->pool, sizeof(htmlSAXHandler));
+	Ctx *ctx = apr_palloc(r->pool, sizeof(Ctx));
 	loginfo(r, "ok kikou");
-	
+	ctx->r = r;
 	rc->hash = apr_hash_make(r->pool);
-	rc->parser = htmlCreatePushParserCtxt(NULL, NULL, NULL, 0, NULL, 0);
+	rc->parser = htmlCreatePushParserCtxt(sax, ctx, NULL, 0, NULL, 0);
+	sax->startElement = pStartElement;
 	loginfo(r, "ok création parser");
 	ap_set_module_config(r->request_config, &atinclusion_module, rc);
 	apr_pool_cleanup_register(r->pool, rc->parser, htmlFreeParserCtxt, apr_pool_cleanup_null);
@@ -109,7 +120,7 @@ static int remove_atinclusions(request_rec *r)
 	// we split the uri, so we remove the atinclusions from it :
 	atinclusions[0] = '\0'; // we replace '@' by '\0'
 	atinclusions++; // and we move the pointer to the next character
-	setConfig(r);
+	set_config(r);
 	res = storeatinclusions(atinclusions, r);
 	if(res == SPLIT_REDIR){
 		// NOTE : seems like apr_pstrcat does not provide the correct behaviour, 
@@ -145,7 +156,7 @@ static int storeatinclusions(char *atinclusions, request_rec *r){
 			ret = SPLIT_REDIR;
 		}
 		else{
-			value = allocate_str(r->pool, value);
+			value = apr_pstrdup(r->pool, value);
 		}
 		// do we replace a key that already exist ?
 		if( apr_hash_get(rc->hash, key, APR_HASH_KEY_STRING) ){
@@ -214,7 +225,6 @@ static apr_status_t atinclusion_filter(ap_filter_t* f, apr_bucket_brigade* bb)
 			logerror(r, "Error in bucket read");
 		}
 	}
-	
 	return APR_SUCCESS;
 }
 
