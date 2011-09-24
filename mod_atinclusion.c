@@ -19,14 +19,17 @@
 #define loginfo(r,...)	 log(r, APLOG_INFO, __VA_ARGS__)
 #define logerror(r,...)	 log(r, APLOG_ERR, __VA_ARGS__)
 
-typedef struct req_cfg {
-	apr_hash_t *hash;
-	htmlParserCtxtPtr parser;
-}Req_cfg;
-
 typedef struct ctx {
 	request_rec *r;
 } Ctx;
+static request_rec *sr;
+typedef struct req_cfg {
+	apr_hash_t *hash;
+	/*htmlParserCtxtPtr parser;*/
+	htmlSAXHandler *sax;
+	Ctx* ctx;
+}Req_cfg;
+
 
 /* global module structure */
 module AP_MODULE_DECLARE_DATA atinclusion_module ;
@@ -81,26 +84,34 @@ static void pStartElement(void *vCtx, xmlChar *uname, xmlChar **uattr)
 {
 	Ctx *ctx = (Ctx*) vCtx;
 	int i = 0;
-	xmlChar *attr;
-	while((attr = uattr[i]) != NULL) 
+	xmlChar *attrname, *attrval;
+	loginfo(sr, "go!!! : %i", ctx->r);
+	if(uattr == NULL)
+		return;
+	loginfo(sr, "analyzing %s", uname);
+	for(i = 0; (attrname = uattr[i]) != NULL &&
+		   (attrval = uattr[i+1]) != NULL; i+=2) 
 	{
-		loginfo(ctx->r, "%s", (const char*) attr);
+		loginfo(ctx->r, "%s = %s", (const char*) attrname, (const char*) attrval);
 	}
 	loginfo(ctx->r, "fin startElement");	
 }
 
 static Req_cfg* set_config(request_rec *r){
+	sr = r;
 	Req_cfg *rc = apr_palloc(r->pool, sizeof(Req_cfg));
-	htmlSAXHandler *sax = apr_palloc(r->pool, sizeof(htmlSAXHandler));
+	rc->sax = apr_palloc(r->pool, sizeof(htmlSAXHandler));
+	memset(rc->sax, 0, sizeof(rc->sax));
 	Ctx *ctx = apr_palloc(r->pool, sizeof(Ctx));
-	loginfo(r, "ok kikou");
 	ctx->r = r;
+	loginfo(r, "ctx : %i", ctx->r);
 	rc->hash = apr_hash_make(r->pool);
-	rc->parser = htmlCreatePushParserCtxt(sax, ctx, NULL, 0, NULL, 0);
-	sax->startElement = pStartElement;
-	loginfo(r, "ok création parser");
+	//rc->parser = htmlCreatePushParserCtxt(sax, ctx, NULL, 4, NULL, 0);
+	rc->sax->startElement = pStartElement;
+	rc->ctx = ctx;
+	
 	ap_set_module_config(r->request_config, &atinclusion_module, rc);
-	apr_pool_cleanup_register(r->pool, rc->parser, htmlFreeParserCtxt, apr_pool_cleanup_null);
+	//apr_pool_cleanup_register(r->pool, rc->sax, htmlFreeParserCtxt, apr_pool_cleanup_null);
 	return rc;
 }
 
@@ -127,7 +138,7 @@ static int remove_atinclusions(request_rec *r)
 		// so we use apr_pstrcat to concatene these strings :
 		redir = apr_pstrcat(r->pool,  r->uri, stringify_atinclusions(r), NULL); 
 		apr_table_setn(r->headers_out, "Location", redir);
-		ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server,  "redir : %s  ", redir);
+		ap_log_error(APLOG_MARK, APLOG_INFO, 0, r->server,  "redir : %s ", redir);
 		return HTTP_MOVED_TEMPORARILY;
 	}	       
 	//ap_internal_redirect(new_uri, r);
@@ -140,6 +151,8 @@ static int storeatinclusions(char *atinclusions, request_rec *r){
 	char *c , *key, *value;
 	int ret = SPLIT_OK;
 	Req_cfg *rc = ap_get_module_config(r->request_config, &atinclusion_module);
+	if(!rc)
+		return -1;
 	c = atinclusions;
 	while(c != NULL){
 		key = c;
@@ -178,53 +191,72 @@ static apr_status_t atinclusion_filter(ap_filter_t* f, apr_bucket_brigade* bb)
 {
 	apr_bucket* b;
 	request_rec *r = f->r;
-	char* buf = 0 ;
+	const char* buf = 0 ;
 	apr_size_t bytes = 0 ;
 	int rs;
+	htmlParserCtxtPtr parser = NULL;
 	Req_cfg* rc = ap_get_module_config(r->request_config, &atinclusion_module );
-	if(!rc){
-		loginfo(r, "rc is null");
+	if(rc == NULL){
+		loginfo(r, "MOD_ATINCLUSION : rc is null, abort");
 		return ap_pass_brigade(f->next, bb);
 	}
-	loginfo(r, "ok");
-	loginfo(r, "content-type: %s", r->content_type);
 	// if non-(x)html document, we abort
 	if(strncasecmp(r->content_type, "text/html", 9) &&
 	    strncasecmp(r->content_type, "application/xhtml+xml", 21)){
 		loginfo(r, "Non-HTML File, do not treat it : %s", r->filename);
 		return APR_SUCCESS;
 	}
-	loginfo(r, "ok2");
-	loginfo(r, "test");
-	loginfo(r, "pointer : %i", rc==NULL);
+	loginfo(r, "create parser");
+	
+	apr_pool_cleanup_register(r->pool, parser, 
+				  (int(*)(void*))htmlFreeParserCtxt, apr_pool_cleanup_null) ;
+	loginfo(r, "parser creation ok");
 	for (b = APR_BRIGADE_FIRST(bb) ;
 	     b != APR_BRIGADE_SENTINEL(bb) ;
 	     b = APR_BUCKET_NEXT(b) ) {
 			// inspired from mod_proxy_html : 
 		    if ( APR_BUCKET_IS_METADATA(b) ) {
 			if ( APR_BUCKET_IS_EOS(b) ) {
-				if ( rc->parser != NULL ) {
-					htmlParseChunk(rc->parser, "", 0, 1);
+				loginfo(r, "ok?");
+				if ( parser != NULL ) {
+					htmlParseChunk(parser, buf, 0, 1);
+					loginfo(r, "finished");
 				}
 				APR_BUCKET_REMOVE(b);
 				APR_BRIGADE_INSERT_TAIL(bb, b);
 				ap_pass_brigade(f->next, bb) ;
 			} else if ( APR_BUCKET_IS_FLUSH(b) ) {
-				/* pass on flush, except at start where it would cause
+				/* 
+				 * pass on flush, except at start where it would cause
 				 * headers to be sent before doc sniffing
 				 */
-				if ( rc->parser != NULL ) {
+				if ( parser != NULL ) {
 					ap_fflush(f->next, bb) ;
 				}
 			}
 		} else if ( apr_bucket_read(b, &buf, &bytes, APR_BLOCK_READ)
 			== APR_SUCCESS ) {
-			htmlParseChunk(rc->parser, buf, bytes, 0);
+			if(parser == NULL){
+				parser = htmlCreatePushParserCtxt(rc->sax, rc->ctx, 0, 0, NULL, XML_CHAR_ENCODING_NONE);
+				/*buf += 4;
+				bytes -= 4;*/
+				if(parser == NULL){
+					int rv = ap_pass_brigade(f->next, bb);
+					htmlFreeParserCtxt(parser);
+					logerror(r, "MOD_ATINCLUSION : parser creation failed");
+					return rv;
+				}
+			}
+			loginfo(r,"parsing : %s [%i] with %i", buf, bytes, parser);
+			loginfo(r, "creation ok : %i", rc->ctx);
+			htmlParseChunk(parser, buf, bytes, 0);
+			loginfo(r, "parse ok");
 		}
 		else{
 			logerror(r, "Error in bucket read");
 		}
 	}
+	loginfo(r,"???");
 	return APR_SUCCESS;
 }
 
