@@ -8,6 +8,7 @@
 #include <http_log.h>
 #include <apr_hash.h>
 #include <apr_strings.h>
+#include <apr_buckets.h>
 #include <libxml/HTMLparser.h>
 
 #define URI_LENGTH 	strlen(r->uri)
@@ -18,14 +19,27 @@
 #define log(r,type, ...) ap_log_error(APLOG_MARK, type, 0, (r)->server, __VA_ARGS__)
 #define loginfo(r,...)	 log(r, APLOG_INFO, __VA_ARGS__)
 #define logerror(r,...)	 log(r, APLOG_ERR, __VA_ARGS__)
+//#define splitbucket(ctx) apr_bucket_split((ctx->curBucket), ctx->length_read - xmlByteConsumed(ctx->parser) +1)
+
+typedef struct content2rem{
+	apr_bucket* from;
+	apr_bucket* to;
+	char* tNodeName;
+	int stackNodeName; // since there are sub-elements having the same name than the target,
+			   // we use this variable, so it is greater than 0 when they are being processed
+	int enabled; // are we removing the content of a target ?
+}Content2Rem;
 
 typedef struct ctx {
 	request_rec *r;
-} Ctx;
-static request_rec *sr;
-typedef struct req_cfg {
+	htmlParserCtxt* parser;
+	unsigned long length_read;
+	apr_bucket *curBucket;
 	apr_hash_t *hash;
-	/*htmlParserCtxtPtr parser;*/
+	Content2Rem *c2r;
+	char* tmp_buf;
+} Ctx;
+typedef struct req_cfg {
 	htmlSAXHandler *sax;
 	Ctx* ctx;
 }Req_cfg;
@@ -37,12 +51,12 @@ static char* stringify_atinclusions(request_rec *r);
 static char* split_and_next(char* str, char splitter);
 static int storeatinclusions(char *atinclusions, request_rec *r);
 static int remove_atinclusions(request_rec *r);
-
+static void splitbucket(Ctx* ctx, int correction);
 
 static char* stringify_atinclusions(request_rec *r){
 	Req_cfg *rc = ap_get_module_config(r->request_config,
 		&atinclusion_module);
-	apr_hash_t *h = rc->hash;
+	apr_hash_t *h = rc->ctx->hash;
 	apr_pool_t *p = r->pool;
 	apr_hash_index_t *hi;
 	char splitter[] = {'@',','};
@@ -80,36 +94,102 @@ static char* split_and_next(char* str, char splitter)
 	return next;
 }
 
+static void splitbucket(Ctx* ctx, int correction){
+	long offset = xmlByteConsumed(ctx->parser) + correction - ctx->length_read;
+	apr_bucket_split((ctx->curBucket), offset);
+	ctx->length_read += offset;
+}
+
 static void pStartElement(void *vCtx, xmlChar *uname, xmlChar **uattr)
 {
 	Ctx *ctx = (Ctx*) vCtx;
+	request_rec *r = ctx->r;
 	int i = 0;
+	Content2Rem* c2r = ctx->c2r;
 	xmlChar *attrname, *attrval;
-	loginfo(sr, "go!!! : %i", ctx->r);
+	loginfo(r, "analyzing %s", uname);
+	if(c2r->enabled){ // if we are in a target element
+		// if the current elements have the same name than the target element :
+		if(strcasecmp(c2r->tNodeName, uname)) 
+			c2r->stackNodeName++; 
+		return; // we can directly abort since this element will be removed soon
+	}
 	if(uattr == NULL)
 		return;
-	loginfo(sr, "analyzing %s", uname);
+	if(ctx->parser == NULL){
+		logerror(r, "parser is NULL");
+		return;
+	}
+		
 	for(i = 0; (attrname = uattr[i]) != NULL &&
 		   (attrval = uattr[i+1]) != NULL; i+=2) 
 	{
-		loginfo(ctx->r, "%s = %s", (const char*) attrname, (const char*) attrval);
+		loginfo(r, "%s = %s", (const char*) attrname, (const char*) attrval);
+		if( strcasecmp(attrname, "href") == 0){
+			
+		}
+		else if(strcasecmp(attrname, "id") == 0 && apr_hash_get( ctx->hash, attrval, APR_HASH_KEY_STRING )){
+			loginfo(r, "found id : %s", attrval);
+			c2r->enabled = 1;
+			splitbucket(ctx, +1);
+			c2r->from = ctx->curBucket = APR_BUCKET_NEXT(ctx->curBucket);
+			loginfo(r, "from : %i", c2r->from);
+			loginfo(r, "next : %s", &ctx->tmp_buf[xmlByteConsumed(ctx->parser)]);
+			//qloginfo(r, "will be removed : %s", ctx->tmp_buf + ctx->length_read - xmlByteConsumed(ctx->parser) +1);
+			c2r->tNodeName = apr_pstrdup(r, uname);
+			c2r->stackNodeName = 0;
+			//*(ctx->curBucket) = c2r->from;
+		}
 	}
-	loginfo(ctx->r, "fin startElement");	
+	
+	loginfo(r, "consummed : %i", xmlByteConsumed(ctx->parser));
+	loginfo(r, "fin startElement");
+}
+
+static void pEndElement(void *vCtx, xmlChar* uname){
+	Ctx* ctx = (Ctx*) vCtx;
+	Content2Rem *c2r = ctx->c2r;
+	apr_bucket *b;
+	loginfo(ctx->r,"end of %s",uname);
+	if(c2r->enabled){
+		loginfo(ctx->r, "testing %s", c2r->tNodeName);
+		if(strcasecmp(uname, c2r->tNodeName)){
+			if(c2r->stackNodeName)
+				c2r->stackNodeName--;
+			else{
+				c2r->enabled = 0;
+				splitbucket(ctx, -3-strlen(uname));
+				c2r->to = APR_BUCKET_NEXT(ctx->curBucket);
+				loginfo(ctx->r, "to : %i", c2r->to);
+				//loginfo(ctx->r, "%s", &ctx->tmp_buf[xmlByteConsumed(ctx->parser) -3-strlen(uname) - ctx->length_read]);
+				APR_BUCKET_REMOVE(c2r->from);
+				/*for(b = c2r->from; b != c2r->to; 
+				    b = APR_BUCKET_NEXT(b)){
+					loginfo(ctx->r, "removing bucket : %i", b);
+					APR_BUCKET_REMOVE(b);
+				}*/
+				memset(c2r, 0, sizeof(Content2Rem));
+			}
+		}
+	}
 }
 
 static Req_cfg* set_config(request_rec *r){
-	sr = r;
+	loginfo(r, "test");
 	Req_cfg *rc = apr_palloc(r->pool, sizeof(Req_cfg));
 	rc->sax = apr_palloc(r->pool, sizeof(htmlSAXHandler));
 	memset(rc->sax, 0, sizeof(rc->sax));
 	Ctx *ctx = apr_palloc(r->pool, sizeof(Ctx));
 	ctx->r = r;
+	ctx->parser = NULL;
 	loginfo(r, "ctx : %i", ctx->r);
-	rc->hash = apr_hash_make(r->pool);
+	ctx->hash = apr_hash_make(r->pool);
+	ctx->c2r = apr_palloc(r->pool, sizeof(Content2Rem));
+	memset(ctx->c2r, 0, sizeof(Content2Rem));
 	//rc->parser = htmlCreatePushParserCtxt(sax, ctx, NULL, 4, NULL, 0);
 	rc->sax->startElement = pStartElement;
+	rc->sax->endElement = pEndElement;
 	rc->ctx = ctx;
-	
 	ap_set_module_config(r->request_config, &atinclusion_module, rc);
 	//apr_pool_cleanup_register(r->pool, rc->sax, htmlFreeParserCtxt, apr_pool_cleanup_null);
 	return rc;
@@ -151,6 +231,7 @@ static int storeatinclusions(char *atinclusions, request_rec *r){
 	char *c , *key, *value;
 	int ret = SPLIT_OK;
 	Req_cfg *rc = ap_get_module_config(r->request_config, &atinclusion_module);
+	apr_hash_t* hash = rc->ctx->hash;
 	if(!rc)
 		return -1;
 	c = atinclusions;
@@ -172,14 +253,14 @@ static int storeatinclusions(char *atinclusions, request_rec *r){
 			value = apr_pstrdup(r->pool, value);
 		}
 		// do we replace a key that already exist ?
-		if( apr_hash_get(rc->hash, key, APR_HASH_KEY_STRING) ){
-			apr_hash_set(rc->hash, key, 
+		if( apr_hash_get(hash, key, APR_HASH_KEY_STRING) ){
+			apr_hash_set(hash, key, 
 				     APR_HASH_KEY_STRING, NULL); // we remove the old key
 			ret = SPLIT_REDIR;
 		}
 		
 		// we store :
-		apr_hash_set(rc->hash, key, APR_HASH_KEY_STRING, 
+		apr_hash_set(hash, key, APR_HASH_KEY_STRING, 
 				value);
 		
 	}
@@ -187,13 +268,13 @@ static int storeatinclusions(char *atinclusions, request_rec *r){
 }
 
 
-static apr_status_t atinclusion_filter(ap_filter_t* f, apr_bucket_brigade* bb) 
+static apr_status_t atinclusion_filter(ap_filter_t* f, apr_bucket_brigade* bb)
 {
 	apr_bucket* b;
 	request_rec *r = f->r;
 	const char* buf = 0 ;
 	apr_size_t bytes = 0 ;
-	int rs;
+	int rs, enabled_before;
 	htmlParserCtxtPtr parser = NULL;
 	Req_cfg* rc = ap_get_module_config(r->request_config, &atinclusion_module );
 	if(rc == NULL){
@@ -206,25 +287,24 @@ static apr_status_t atinclusion_filter(ap_filter_t* f, apr_bucket_brigade* bb)
 		loginfo(r, "Non-HTML File, do not treat it : %s", r->filename);
 		return APR_SUCCESS;
 	}
-	loginfo(r, "create parser");
 	
-	apr_pool_cleanup_register(r->pool, parser, 
-				  (int(*)(void*))htmlFreeParserCtxt, apr_pool_cleanup_null) ;
+	
 	loginfo(r, "parser creation ok");
 	for (b = APR_BRIGADE_FIRST(bb) ;
 	     b != APR_BRIGADE_SENTINEL(bb) ;
 	     b = APR_BUCKET_NEXT(b) ) {
+		rc->ctx->curBucket = b;
 			// inspired from mod_proxy_html : 
-		    if ( APR_BUCKET_IS_METADATA(b) ) {
+		if ( APR_BUCKET_IS_METADATA(b) ) {
 			if ( APR_BUCKET_IS_EOS(b) ) {
 				loginfo(r, "ok?");
 				if ( parser != NULL ) {
 					htmlParseChunk(parser, buf, 0, 1);
 					loginfo(r, "finished");
 				}
+				
 				APR_BUCKET_REMOVE(b);
 				APR_BRIGADE_INSERT_TAIL(bb, b);
-				ap_pass_brigade(f->next, bb) ;
 			} else if ( APR_BUCKET_IS_FLUSH(b) ) {
 				/* 
 				 * pass on flush, except at start where it would cause
@@ -234,10 +314,16 @@ static apr_status_t atinclusion_filter(ap_filter_t* f, apr_bucket_brigade* bb)
 					ap_fflush(f->next, bb) ;
 				}
 			}
-		} else if ( apr_bucket_read(b, &buf, &bytes, APR_BLOCK_READ)
+		} 
+		else if ( apr_bucket_read(b, &buf, &bytes, APR_BLOCK_READ)
 			== APR_SUCCESS ) {
+			
+			rc->ctx->tmp_buf = buf;
 			if(parser == NULL){
 				parser = htmlCreatePushParserCtxt(rc->sax, rc->ctx, 0, 0, NULL, XML_CHAR_ENCODING_NONE);
+				apr_pool_cleanup_register(r->pool, parser, 
+							  (int(*)(void*))htmlFreeParserCtxt, apr_pool_cleanup_null) ;
+				rc->ctx->parser = parser;
 				/*buf += 4;
 				bytes -= 4;*/
 				if(parser == NULL){
@@ -247,9 +333,12 @@ static apr_status_t atinclusion_filter(ap_filter_t* f, apr_bucket_brigade* bb)
 					return rv;
 				}
 			}
-			loginfo(r,"parsing : %s [%i] with %i", buf, bytes, parser);
 			loginfo(r, "creation ok : %i", rc->ctx);
 			htmlParseChunk(parser, buf, bytes, 0);
+			b = rc->ctx->curBucket; // if we moved the bucket
+			rc->ctx->length_read += bytes;
+			
+			
 			loginfo(r, "parse ok");
 		}
 		else{
@@ -257,7 +346,8 @@ static apr_status_t atinclusion_filter(ap_filter_t* f, apr_bucket_brigade* bb)
 		}
 	}
 	loginfo(r,"???");
-	return APR_SUCCESS;
+	
+	return ap_pass_brigade(f->next, bb) ;
 }
 
 static void atinclusion_filter_insert(request_rec *r)
