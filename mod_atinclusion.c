@@ -136,7 +136,7 @@ static void pStartElement(void *vCtx, xmlChar *uname, xmlChar **uattr)
 			loginfo(r, "from : %i", c2r->from);
 			loginfo(r, "next : %s", &ctx->tmp_buf[xmlByteConsumed(ctx->parser)]);
 			//qloginfo(r, "will be removed : %s", ctx->tmp_buf + ctx->length_read - xmlByteConsumed(ctx->parser) +1);
-			c2r->tNodeName = apr_pstrdup(r, uname);
+			c2r->tNodeName = apr_pstrdup(r->pool, uname);
 			c2r->stackNodeName = 0;
 			//*(ctx->curBucket) = c2r->from;
 		}
@@ -150,6 +150,9 @@ static void pEndElement(void *vCtx, xmlChar* uname){
 	Ctx* ctx = (Ctx*) vCtx;
 	Content2Rem *c2r = ctx->c2r;
 	apr_bucket *b;
+	const char* uri;
+	request_rec* rr;
+	int rrv;
 	loginfo(ctx->r,"end of %s",uname);
 	if(c2r->enabled){
 		loginfo(ctx->r, "testing %s", c2r->tNodeName);
@@ -162,12 +165,26 @@ static void pEndElement(void *vCtx, xmlChar* uname){
 				c2r->to = APR_BUCKET_NEXT(ctx->curBucket);
 				loginfo(ctx->r, "to : %i", c2r->to);
 				//loginfo(ctx->r, "%s", &ctx->tmp_buf[xmlByteConsumed(ctx->parser) -3-strlen(uname) - ctx->length_read]);
-				APR_BUCKET_REMOVE(c2r->from);
-				/*for(b = c2r->from; b != c2r->to; 
-				    b = APR_BUCKET_NEXT(b)){
+				//APR_BUCKET_REMOVE(c2r->from);
+				for(b = c2r->from; b != c2r->to; 
+				      b = APR_BUCKET_NEXT(b)){
 					loginfo(ctx->r, "removing bucket : %i", b);
 					APR_BUCKET_REMOVE(b);
-				}*/
+				}
+				uri = apr_hash_get(ctx->hash, c2r->tNodeName, APR_HASH_KEY_STRING);
+				rr = ap_sub_req_lookup_uri(uri, ctx->r, NULL);
+				if(rr== NULL || rr->status != HTTP_OK){
+					logerror(ctx->r, "MOD_ATINCLUSION : could not include %s", uri);
+					return;
+				}
+				//if(rr->content_type)
+				rrv = ap_run_sub_req(rr);
+				if(rrv){
+					logerror(ctx->r, "MOD_ATINCLUSION : could not run the request");
+					return;
+				}
+				ctx->curBucket = c2r->from;
+				
 				memset(c2r, 0, sizeof(Content2Rem));
 			}
 		}
